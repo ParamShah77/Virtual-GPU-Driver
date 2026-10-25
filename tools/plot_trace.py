@@ -52,17 +52,18 @@ def summarize(rows):
     # Shares are only meaningful while the channels were actually competing:
     # stop counting at the moment the first channel on an engine ran its last
     # command.
+    work = ("cmd", "chunk")   # a chunk is part of a preempted command
     last = {}
     for r in rows:
-        if r["type"] == "cmd":
+        if r["type"] in work:
             last[(r["engine"], r["chan"])] = r["ts_ns"]
     window_end = {}
     for (e, c), ts in last.items():
         window_end[e] = min(window_end.get(e, ts), ts)
     for r in rows:
-        if r["type"] == "cmd" and r["ts_ns"] <= window_end[r["engine"]]:
+        if r["type"] in work and r["ts_ns"] <= window_end[r["engine"]]:
             cost[(r["engine"], r["chan"])] += r["arg2"]
-            cmds[(r["engine"], r["chan"])] += 1
+            cmds[(r["engine"], r["chan"])] += r["type"] == "cmd"
     for eng in sorted({k[0] for k in cost}):
         total = sum(v for k, v in cost.items() if k[0] == eng) or 1
         print(f"engine {ENGINE_NAMES.get(eng, eng)} (until first channel drained):")

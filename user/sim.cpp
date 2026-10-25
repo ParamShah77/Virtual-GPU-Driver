@@ -77,6 +77,7 @@ void SimGpu::engine_loop(uint32_t e)
     // Linux timers can't sleep for a microsecond; batch the modelled cost.
     constexpr uint64_t kPaceChunkNs = 50000;
     uint64_t owed = 0;
+    uint64_t idle_since = 0;
 
     auto settle = [&] {
         if (cfg_.pace && owed) {
@@ -97,21 +98,28 @@ void SimGpu::engine_loop(uint32_t e)
         vrm_engine_step(gpu_.get(), e, &st);
         if (st.signal)
             signal();
-        switch (st.kind) {
-        case VRM_STEP_RAN:
+        if (st.kind == VRM_STEP_RAN) {
+            idle_since = 0;
             owed += st.sleep_ns;
             if (owed >= kPaceChunkNs)
                 settle();
-            break;
-        case VRM_STEP_IDLE:
-            settle();
-            wait_event(seen, -1);
-            break;
-        case VRM_STEP_BLOCKED:
-            settle();
-            wait_event(seen, 200);
-            break;
+            continue;
         }
+        settle();
+        // Out of work: poll briefly (clients submit without doorbells while
+        // we're awake), then arm need_doorbell and sleep.
+        uint64_t now = vrm_now_ns();
+        if (!idle_since)
+            idle_since = now;
+        if (now - idle_since < cfg_.poll_ns) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (vrm_engine_arm_sleep(gpu_.get(), e))
+            continue;
+        wait_event(seen, st.kind == VRM_STEP_IDLE ? -1 : 200);
+        vrm_engine_disarm(gpu_.get(), e);
+        idle_since = 0;
     }
 }
 

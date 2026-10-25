@@ -31,6 +31,7 @@ static inline u64 vrm_now_ns(void)       { return ktime_get_ns(); }
 
 #define vrm_load_acquire32(p)       smp_load_acquire(p)
 #define vrm_store_release32(p, v)   smp_store_release(p, v)
+#define vrm_mb()                    smp_mb()
 #define vrm_log(...)                pr_debug("vgpu: " __VA_ARGS__)
 
 #else /* user space */
@@ -74,6 +75,7 @@ static inline u64 vrm_now_ns(void)
 
 #define vrm_load_acquire32(p)       __atomic_load_n((p), __ATOMIC_ACQUIRE)
 #define vrm_store_release32(p, v)   __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#define vrm_mb()                    __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define vrm_log(...)                ((void)0)
 
 #endif /* __KERNEL__ */

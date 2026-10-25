@@ -98,7 +98,10 @@ public:
     Channel &wait_sem(uint64_t sem_va, uint32_t value);
     Channel &raw(const vgpu_cmd &cmd);
 
-    void submit();                                  // publish put + doorbell
+    // Publish put; ring the doorbell only if the engine asked for one.
+    void submit();
+    // Benchmark/debug: always take the ioctl path, like a classic doorbell.
+    void set_always_doorbell(bool on) { always_doorbell_ = on; }
     bool idle() const;                              // get == put
     void wait_idle(uint32_t timeout_ms = 5000);     // throws on timeout/fault
     uint32_t error() const;                         // enum vgpu_fault
@@ -117,6 +120,7 @@ private:
     uint32_t id_ = 0;
     uint32_t entries_ = 0;
     uint32_t local_put_ = 0;
+    bool always_doorbell_ = false;
 };
 
 class Device {

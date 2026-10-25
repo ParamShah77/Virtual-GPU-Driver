@@ -3,6 +3,7 @@
 //
 //   vgpu_tests [--backend sim|kernel] [--dev /dev/vgpu0] [substring-filter]
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -461,6 +462,120 @@ TEST(scheduler_priority_scales_timeslice)
     CHECK(s.a >= s.n);
     // HIGH slices are 4x LOW slices, so LOW gets ~1/4 of HIGH's throughput.
     CHECK(s.b > s.n / 5 && s.b < s.n / 3);
+}
+
+// A 16 MiB memset costs ~2.1 ms of engine time, twice a LOW timeslice. With
+// chunked execution the scheduler preempts it mid-command, so no slice may
+// overrun its budget by more than one chunk.
+TEST(preemption_mid_command_bounds_slices)
+{
+    Device d = env.new_device();
+    const size_t big = 16 << 20;
+    Buffer bbuf = d.alloc(big), sbuf = d.alloc(256 << 10);
+    Buffer gate = d.alloc(4096);
+    Channel hog = d.channel(COPY, VGPU_PRIO_LOW);
+    Channel small = d.channel(COPY, VGPU_PRIO_NORMAL);
+
+    hog.wait_sem(gate.va(), 1);
+    for (int i = 0; i < 6; i++)
+        hog.memset(bbuf.va(), big, (uint8_t)(i + 1));
+    small.wait_sem(gate.va(), 1);
+    for (int i = 0; i < 100; i++)
+        small.memset(sbuf.va(), 256 << 10, 7);
+    uint64_t cursor = 0;
+    d.read_trace(&cursor);
+    hog.submit();
+    small.submit();
+    __atomic_store_n(gate.as<uint32_t>(), 1u, __ATOMIC_RELEASE);
+    hog.wait_idle(30000);
+    small.wait_idle(30000);
+
+    vgpu_info info = d.info();
+    uint64_t budget = info.timeslice_ns[VGPU_PRIO_LOW];
+    uint64_t chunk_cost = 1000 + (256 << 10) / 8;
+    uint64_t worst = 0;
+    int mid_cmd = 0;
+    for (auto &e : d.read_trace(&cursor)) {
+        if (e.type != VGPU_EV_SLICE_END || e.chan != hog.id())
+            continue;
+        worst = std::max<uint64_t>(worst, e.arg2);
+        mid_cmd += e.arg;
+    }
+    std::fprintf(stderr, "    worst LOW slice %.3f ms (budget %.3f), %d preempted mid-command\n",
+                 worst / 1e6, budget / 1e6, mid_cmd);
+    CHECK(worst <= budget + chunk_cost);
+    CHECK(mid_cmd > 0);
+    CHECK(all_bytes(bbuf.data(), big, 6));
+}
+
+// MEMCPY keeps memmove semantics across chunk boundaries in both directions.
+TEST(chunked_memcpy_overlap_is_memmove)
+{
+    Device d = env.new_device();
+    const size_t N = 2 << 20, len = 1536 << 10, shift = 4096 + 12;
+    Buffer buf = d.alloc(N), sem = d.alloc(4096);
+    Channel ch = d.channel(COPY);
+    std::vector<uint8_t> ref(N);
+
+    fill_pattern(buf.data(), N, 3);
+    std::memcpy(ref.data(), buf.data(), N);
+    ch.memcpy(buf.va() + shift, buf.va(), len);          // dst above src
+    sync(d, ch, sem, 1);
+    std::memmove(ref.data() + shift, ref.data(), len);
+    CHECK(std::memcmp(ref.data(), buf.data(), N) == 0);
+
+    ch.memcpy(buf.va(), buf.va() + shift, len);          // dst below src
+    sync(d, ch, sem, 2);
+    std::memmove(ref.data(), ref.data() + shift, len);
+    CHECK(std::memcmp(ref.data(), buf.data(), N) == 0);
+}
+
+// While an engine is awake, clients submit with plain memory writes.
+TEST(submission_skips_doorbell_while_engine_busy)
+{
+    Device d = env.new_device();
+    Buffer big = d.alloc(16 << 20);
+    Channel busy = d.channel(COPY);
+    Channel ch = d.channel(COPY);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));   // engine asleep, armed
+
+    for (int i = 0; i < 40; i++)
+        busy.memset(big.va(), 16 << 20, 1);
+    busy.submit();                                   // wakes the engine
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    uint64_t db0 = d.info().doorbells;
+    for (int i = 0; i < 200; i++)
+        ch.nop().submit();
+    uint64_t db1 = d.info().doorbells;
+    busy.wait_idle(30000);
+    ch.wait_idle(30000);
+    std::fprintf(stderr, "    200 submits while busy -> %llu doorbell ioctls\n",
+                 (unsigned long long)(db1 - db0));
+    CHECK(db1 - db0 <= 5);
+    CHECK(ch.stats().cmds_executed == 200);
+}
+
+// Hammer the engine's poll -> arm -> sleep transition: every submission must
+// complete whether the engine was polling, arming or asleep.
+TEST(no_lost_wakeups_across_sleep_transitions)
+{
+    Device d = env.new_device();
+    Buffer sem = d.alloc(4096);
+    Channel ch = d.channel(COPY);
+    std::mt19937 rng(42);
+    int lost = 0;
+    for (uint32_t i = 1; i <= 1500; i++) {
+        uint32_t r = rng() % 100;
+        if (r < 10)
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+        else if (r < 60)
+            std::this_thread::sleep_for(std::chrono::microseconds(rng() % 40));
+        ch.fence(sem.va(), i).submit();
+        if (!d.wait_sem(sem.va(), i, 2000))
+            lost++;
+    }
+    CHECK(lost == 0);
 }
 
 TEST(trace_records_scheduling_events)

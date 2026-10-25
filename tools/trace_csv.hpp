@@ -16,6 +16,7 @@ inline const char *trace_type_name(uint32_t t)
     case VGPU_EV_DOORBELL:    return "doorbell";
     case VGPU_EV_FAULT:       return "fault";
     case VGPU_EV_BLOCKED:     return "blocked";
+    case VGPU_EV_CHUNK:       return "chunk";
     default:                  return "unknown";
     }
 }

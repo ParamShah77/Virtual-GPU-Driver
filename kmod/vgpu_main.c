@@ -31,6 +31,10 @@ static bool pace;
 module_param(pace, bool, 0644);
 MODULE_PARM_DESC(pace, "Sleep for the modelled cost of each command (default off)");
 
+static unsigned int poll_us = 20;
+module_param(poll_us, uint, 0644);
+MODULE_PARM_DESC(poll_us, "Engine spin-poll time before sleeping, in us (default 20)");
+
 struct vgpu_dev {
 	struct vrm_gpu *gpu;
 	void *vram;
@@ -69,7 +73,7 @@ static void pace_settle(u64 *owed)
 static int vgpu_engine_thread(void *data)
 {
 	u32 e = (unsigned long)data;
-	u64 owed = 0;
+	u64 owed = 0, idle_since = 0, now;
 
 	while (!kthread_should_stop()) {
 		struct vrm_step st;
@@ -79,30 +83,45 @@ static int vgpu_engine_thread(void *data)
 		if (st.signal)
 			vgpu_signal();
 
-		switch (st.kind) {
-		case VRM_STEP_RAN:
+		if (st.kind == VRM_STEP_RAN) {
+			idle_since = 0;
 			owed += st.sleep_ns;
 			if (owed >= PACE_CHUNK_NS)
 				pace_settle(&owed);
 			cond_resched();
-			break;
-		case VRM_STEP_IDLE:
-			pace_settle(&owed);
+			continue;
+		}
+		pace_settle(&owed);
+
+		/*
+		 * Out of work. Poll for poll_us first: while the engine is awake,
+		 * clients submit by writing 'put' only, no ioctl. Then arm
+		 * need_doorbell in every control page and sleep.
+		 */
+		now = ktime_get_ns();
+		if (!idle_since)
+			idle_since = now;
+		if (now - idle_since < (u64)poll_us * NSEC_PER_USEC) {
+			cpu_relax();
+			cond_resched();
+			continue;
+		}
+		if (vrm_engine_arm_sleep(vdev.gpu, e))
+			continue;
+		if (st.kind == VRM_STEP_IDLE)
 			/* Interruptible, so an idle engine doesn't count as load
 			 * or trip the hung-task detector. */
 			wait_event_interruptible(vdev.wq,
 						 atomic64_read(&vdev.seq) != seen ||
 						 kthread_should_stop());
-			break;
-		case VRM_STEP_BLOCKED:
-			pace_settle(&owed);
+		else
 			/* Semaphores can also be released by the CPU with no wakeup. */
 			wait_event_interruptible_hrtimeout(vdev.wq,
 					atomic64_read(&vdev.seq) != seen ||
 					kthread_should_stop(),
 					ns_to_ktime(200 * NSEC_PER_USEC));
-			break;
-		}
+		vrm_engine_disarm(vdev.gpu, e);
+		idle_since = 0;
 	}
 	return 0;
 }
@@ -356,6 +375,8 @@ static int vgpu_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "vram: %llu KiB total, %llu KiB free, largest free run %u KiB\n",
 		   g->vram_bytes >> 10, (u64)g->free_pages << (VGPU_PAGE_SHIFT - 10),
 		   vrm_vram_largest_free(g) << (VGPU_PAGE_SHIFT - 10));
+	seq_printf(m, "doorbell ioctls: %llu, engine poll: %u us\n", g->doorbells,
+		   poll_us);
 	seq_printf(m, "pace: %s, timeslices(us): low=%llu normal=%llu high=%llu\n",
 		   pace ? "on" : "off", g->timeslice_ns[0] / 1000,
 		   g->timeslice_ns[1] / 1000, g->timeslice_ns[2] / 1000);

@@ -96,9 +96,33 @@ simulator, independent of timer jitter, and it is what the fairness tests
 assert on. With `pace=1` the engine thread additionally sleeps for the modelled
 cost so wall-clock latency and bandwidth look like a slower device.
 
-Preemption is at command boundaries only. A real GPU preempts mid-kernel; this
-model does not, so a single huge command can overrun its slice (commands are
-capped at 16 MiB to bound this).
+**Mid-command preemption.** MEMSET, MEMCPY and VEC_* execute in chunks
+(256 KiB, or 64 Ki elements). The channel keeps `progress` for its head command
+and `get` advances only when the last chunk completes, so a timeslice can
+expire in the middle of a command and the channel later resumes at the same
+offset. The whole range is translated before the first chunk, so a bad address
+faults before any bytes are written. Overlapping MEMCPY keeps memmove semantics
+by copying back to front when the destination overlaps the end of the source.
+A slice can overrun its budget by at most one chunk (~33 µs).
+
+## Doorbell-less submission
+
+A doorbell ioctl on every submit costs a syscall. Like io_uring's SQPOLL mode,
+the engine only asks for doorbells while it is asleep:
+
+* When it runs out of work, an engine spin-polls for `poll_us` (default 20 µs).
+* It then sets `need_doorbell = 1` in every control page on that engine,
+  issues a full barrier, and re-checks every ring. If work appeared, it clears
+  the flags and keeps running; otherwise it sleeps. On waking it clears the
+  flags.
+* A client stores `put` (release), issues a full barrier, and calls the
+  doorbell ioctl only if `need_doorbell` is set.
+
+This is a Dekker-style handshake. With both barriers in place, either the
+engine's re-check sees the new `put` or the client sees the flag, so a
+submission can never be stranded. `no_lost_wakeups_across_sleep_transitions`
+targets exactly this window. `Channel::set_always_doorbell(true)` restores the
+classic path for comparison.
 
 ## Concurrency and locking
 
@@ -126,10 +150,10 @@ capped at 16 MiB to bound this).
 
 ## Known simplifications
 
-* Doorbell is an ioctl, not a mapped register page.
+* The doorbell, when one is needed, is an ioctl rather than a mapped register.
 * No DMA / PCI / interrupts; the "device" is the engine threads.
 * Contiguous VRAM allocation only, so the allocator can fragment (the tests
   show this on purpose).
 * One lock for everything; fine at this scale, the first thing to split for
   more engines.
-* Commands execute atomically with respect to the scheduler (see Preemption).
+* Preemption granularity is one chunk, not one instruction.

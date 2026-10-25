@@ -78,6 +78,7 @@ struct vrm_channel {
 	u32 ring_entries;
 	struct vrm_obj *ctrl_obj;
 	struct vgpu_chan_ctrl *ctrl;   /* points into VRAM */
+	u64 progress;              /* bytes/elements done of the head command */
 	u64 cmds_executed;
 	u64 busy_ns;
 	u64 slices;
@@ -123,6 +124,8 @@ struct vrm_gpu {
 
 	struct vrm_fault_rec faults[VRM_FAULT_LOG];
 	u64 fault_seq;
+
+	u64 doorbells;
 };
 
 enum vrm_step_kind {
@@ -162,6 +165,17 @@ int  vrm_chan_doorbell(struct vrm_gpu *g, struct vrm_ctx *ctx, u32 chan_id);
 int  vrm_chan_stats(struct vrm_gpu *g, struct vrm_ctx *ctx,
 		    struct vgpu_chan_stats *st);
 void vrm_engine_step(struct vrm_gpu *g, u32 engine, struct vrm_step *st);
+
+/*
+ * Doorbell-less submission. Before an engine thread sleeps it calls
+ * vrm_engine_arm_sleep(): this sets need_doorbell in every control page on the
+ * engine, issues a full barrier, then re-checks for work. A non-zero return
+ * means work arrived and the engine must not sleep. After waking it calls
+ * vrm_engine_disarm(). Paired with the client's put-store / barrier /
+ * need_doorbell-load, at least one side always sees the other.
+ */
+int  vrm_engine_arm_sleep(struct vrm_gpu *g, u32 engine);
+void vrm_engine_disarm(struct vrm_gpu *g, u32 engine);
 
 /* Semaphore poll for CPU waiters: *ready set when *va >= value (wrapping).
  * Returns -EIO if the context has a faulted channel, -EFAULT if va unmapped. */

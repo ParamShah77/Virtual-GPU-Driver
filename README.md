@@ -21,11 +21,11 @@ identical test suite runs against both. See [docs/ARCHITECTURE.md](docs/ARCHITEC
 | Area | Where | Highlights |
 | --- | --- | --- |
 | Memory management | `core/vrm_mem.c` | bitmap page allocator, 2-level GPU page tables, guard pages, scrub-on-alloc, pinned mappings |
-| Channels + executor | `core/vrm_exec.c` | lock-free ring submission (acquire/release get/put), 7-op command set, semaphores, fault containment |
-| Scheduler | `core/vrm_exec.c` | per-engine round-robin, priority-scaled timeslices in virtual time (deterministic) |
+| Channels + executor | `core/vrm_exec.c` | lock-free ring submission (acquire/release get/put), doorbell-less submit via `need_doorbell` handshake, 7-op command set, semaphores, fault containment |
+| Scheduler | `core/vrm_exec.c` | per-engine round-robin, priority-scaled timeslices in virtual time (deterministic), chunk-granular mid-command preemption |
 | Kernel driver | `kmod/vgpu_main.c` | misc device, ioctl ABI, `mmap` of vmalloc'd VRAM, per-engine kthreads, `/proc/vgpu` |
 | User runtime | `user/` | RAII `Device` / `Buffer` / `Channel`, backend interface, in-process simulator |
-| Tests | `tests/vgpu_tests.cpp` | 20 tests: allocator, isolation, faults, dependencies, fairness, multithreaded stress |
+| Tests | `tests/vgpu_tests.cpp` | 24 tests: preemption bounds, lost-wakeup stress, allocator, isolation, faults, dependencies, fairness, multithreaded stress |
 | Tooling | `tools/` | `vgpu_bench` (latency, bandwidth, fairness), `vgpu_trace`, `plot_trace.py` Gantt |
 
 ## Build and run (WSL2 Ubuntu)
@@ -58,9 +58,15 @@ filesystem first (fast, and kernel builds dislike drvfs).
 
 ## Results (WSL2, kernel 6.6.87.2, 12 vCPUs)
 
-* All 20 tests pass on both backends. The simulator build is also clean under
+* All 24 tests pass on both backends. The simulator build is also clean under
   ASan+UBSan and TSan. Load/test/unload cycles leave no VRAM leaks and nothing
   in `dmesg`.
+* **Doorbell-less submission** (io_uring SQPOLL-style `need_doorbell`
+  handshake): back-to-back submits went from 3000 ioctls to 1 per 3000, and
+  median submit→fence latency dropped from 1.1 µs to 0.2 µs.
+* **Mid-command preemption**: commands run in 256 KiB chunks. A 16 MiB memset
+  (≈2.1 ms of engine time) on a LOW-priority channel now stays within 1.018 ms
+  per slice against a 1 ms budget, instead of running to completion.
 * The scheduler is deterministic: kernel and simulator produce **identical**
   fairness numbers. Three clients with equal work and LOW/NORMAL/HIGH priority
   get 12.9% / 30.0% / 57.1% of the copy engine while all three are

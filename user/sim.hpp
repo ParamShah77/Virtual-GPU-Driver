@@ -19,6 +19,7 @@ public:
     struct Config {
         uint64_t vram_bytes = 64ull << 20;
         bool pace = false;   // sleep for modelled command cost (wall-clock timing)
+        uint64_t poll_ns = 20000;  // spin this long after running dry before sleeping
     };
 
     explicit SimGpu(const Config &cfg);

@@ -30,18 +30,30 @@ static void latency(const std::function<Device()> &mk)
     Buffer sem = d.alloc(4096);
     Channel ch = d.channel(VGPU_ENGINE_COPY);
     const int N = 3000;
-    std::vector<double> us;
-    for (int i = 1; i <= N; i++) {
-        auto t0 = Clock::now();
-        ch.fence(sem.va(), i).submit();
-        while ((int32_t)(__atomic_load_n(sem.as<uint32_t>(), __ATOMIC_ACQUIRE) - i) < 0)
-            ;
-        us.push_back(us_since(t0));
+    uint32_t value = 0;
+
+    // Back-to-back submissions keep the engine in its poll window, so the
+    // adaptive path needs no ioctl at all; the classic path always takes one.
+    for (bool always : {true, false}) {
+        ch.set_always_doorbell(always);
+        std::vector<double> us;
+        uint64_t db0 = d.info().doorbells;
+        for (int i = 0; i < N; i++) {
+            auto t0 = Clock::now();
+            ch.fence(sem.va(), ++value).submit();
+            while ((int32_t)(__atomic_load_n(sem.as<uint32_t>(), __ATOMIC_ACQUIRE) -
+                             value) < 0)
+                ;
+            us.push_back(us_since(t0));
+        }
+        uint64_t db = d.info().doorbells - db0;
+        std::sort(us.begin(), us.end());
+        std::printf("%-22s submit->fence (us): p50=%5.1f p90=%5.1f p99=%6.1f "
+                    "max=%7.1f  doorbell ioctls=%llu/%d\n",
+                    always ? "always doorbell:" : "adaptive (need_doorbell):",
+                    us[N / 2], us[N * 9 / 10], us[N * 99 / 100], us.back(),
+                    (unsigned long long)db, N);
     }
-    std::sort(us.begin(), us.end());
-    std::printf("submit->fence round trip, %d samples (us): p50=%.1f p90=%.1f "
-                "p99=%.1f max=%.1f\n",
-                N, us[N / 2], us[N * 9 / 10], us[N * 99 / 100], us.back());
 }
 
 static void throughput(const std::function<Device()> &mk)

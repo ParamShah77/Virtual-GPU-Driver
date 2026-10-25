@@ -60,6 +60,13 @@ struct vgpu_chan_ctrl {
 	__u32 put;
 	__u8  pad1[60];
 	__u32 error;   /* enum vgpu_fault; non-zero once the channel has faulted */
+	__u8  pad2[60];
+	/*
+	 * Set by the engine before it sleeps. After publishing 'put' the client
+	 * issues a full barrier and rings the doorbell ioctl only if this is
+	 * set; while the engine is awake, submission is pure memory writes.
+	 */
+	__u32 need_doorbell;
 };
 
 enum vgpu_fault {
@@ -81,7 +88,8 @@ enum vgpu_ev_type {
 	VGPU_EV_CMD         = 3, /* arg=op, arg2=modelled cost in ns          */
 	VGPU_EV_DOORBELL    = 4,
 	VGPU_EV_FAULT       = 5, /* arg=enum vgpu_fault                       */
-	VGPU_EV_BLOCKED     = 6  /* channel parked on WAIT_SEM                */
+	VGPU_EV_BLOCKED     = 6, /* channel parked on WAIT_SEM                */
+	VGPU_EV_CHUNK       = 7  /* partial command; arg=op, arg2=cost in ns  */
 };
 
 struct vgpu_trace_ev {
@@ -110,6 +118,7 @@ struct vgpu_info {
 		__u64 switches;
 	} eng[VGPU_NUM_ENGINES];
 	__u64 now_ns;
+	__u64 doorbells;     /* doorbell ioctls received since load */
 };
 
 struct vgpu_alloc {

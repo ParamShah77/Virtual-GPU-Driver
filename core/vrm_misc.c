@@ -63,5 +63,6 @@ void vrm_gpu_get_info(struct vrm_gpu *g, struct vgpu_info *out)
 		out->eng[i].switches = g->eng[i].switches;
 	}
 	out->now_ns = vrm_now_ns();
+	out->doorbells = g->doorbells;
 	vrm_unlock(&g->lock);
 }

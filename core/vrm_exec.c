@@ -6,8 +6,12 @@
  * Scheduling policy: round-robin over runnable channels bound to an engine;
  * each channel runs for a priority-dependent timeslice measured in the engine's
  * *virtual* clock (the sum of modelled command costs), so behaviour is
- * deterministic and identical in the kernel and user-space builds. Preemption
- * happens only at command boundaries.
+ * deterministic and identical in the kernel and user-space builds.
+ *
+ * Large commands execute in chunks (CHUNK_BYTES / CHUNK_ELEMS). Progress is
+ * kept per channel, so a timeslice can expire in the middle of a command and
+ * the channel resumes where it stopped: preemption granularity is one chunk,
+ * not one command.
  */
 #include "vrm_core.h"
 
@@ -15,6 +19,8 @@
 #define MAX_CMD_BYTES      (16ull << 20)
 #define MAX_VEC_ELEMS      (4u << 20)
 #define MAX_RING_ENTRIES   65536u
+#define CHUNK_BYTES        (256ull << 10)
+#define CHUNK_ELEMS        (64ull << 10)
 
 typedef char vrm_assert_cmd_size[(sizeof(struct vgpu_cmd) == 32) ? 1 : -1];
 typedef char vrm_assert_ctrl_size[(sizeof(struct vgpu_chan_ctrl) <= VGPU_PAGE_SIZE) ? 1 : -1];
@@ -85,6 +91,7 @@ static void chan_fault(struct vrm_gpu *g, struct vrm_channel *ch, u32 code,
 	struct vrm_fault_rec *f = &g->faults[g->fault_seq % VRM_FAULT_LOG];
 
 	ch->state = VRM_CHAN_ERROR;
+	ch->progress = 0;
 	vrm_store_release32(&ch->ctrl->error, code);
 	f->ts_ns = vrm_now_ns();
 	f->chan = ch->id;
@@ -93,6 +100,11 @@ static void chan_fault(struct vrm_gpu *g, struct vrm_channel *ch, u32 code,
 	f->op = op;
 	g->fault_seq++;
 	vrm_trace(g, VGPU_EV_FAULT, ch->id, ch->engine, code, va);
+}
+
+static inline u64 min_u64(u64 a, u64 b)
+{
+	return a < b ? a : b;
 }
 
 /* ---- command execution ------------------------------------------------ */
@@ -107,7 +119,8 @@ static enum exec_result exec_one(struct vrm_gpu *g, struct vrm_channel *ch,
 	u32 get = ch->ctrl->get;
 	u32 put = vrm_load_acquire32(&ch->ctrl->put);
 	u32 code, i;
-	u64 fva = 0, cost = CMD_BASE_NS;
+	u64 fva = 0, off = ch->progress, n, total = 0;
+	u64 cost = off ? 0 : CMD_BASE_NS;   /* fixed overhead once per command */
 	void *dst = NULL, *a = NULL, *b = NULL;
 
 	memset(&cmd, 0, sizeof(cmd));
@@ -132,74 +145,120 @@ static enum exec_result exec_one(struct vrm_gpu *g, struct vrm_channel *ch,
 			goto fault;
 		}
 		fva = cmd.arg0;
-		if (!cmd.arg1 || cmd.arg1 > MAX_CMD_BYTES) {
+		total = cmd.arg1;
+		if (!total || total > MAX_CMD_BYTES) {
 			code = VGPU_FAULT_BAD_ARG;
 			goto fault;
 		}
-		code = vrm_xlate(g, ctx, cmd.arg0, cmd.arg1, 1, &dst);
+		/* Validate the whole range up front: faults are all-or-nothing. */
+		if (!off) {
+			code = vrm_xlate(g, ctx, cmd.arg0, total, 1, &dst);
+			if (code)
+				goto fault;
+		}
+		n = min_u64(total - off, CHUNK_BYTES);
+		code = vrm_xlate(g, ctx, cmd.arg0 + off, n, 1, &dst);
 		if (code)
 			goto fault;
-		memset(dst, (int)(cmd.arg2 & 0xff), cmd.arg1);
-		cost += cmd.arg1 >> 3;          /* 8 bytes / ns */
+		memset(dst, (int)(cmd.arg2 & 0xff), n);
+		cost += n >> 3;                 /* 8 bytes / ns */
+		off += n;
 		break;
 
-	case VGPU_OP_MEMCPY:
+	case VGPU_OP_MEMCPY: {
+		u64 pos;
+
 		if (ch->engine != VGPU_ENGINE_COPY) {
 			code = VGPU_FAULT_WRONG_ENGINE;
 			goto fault;
 		}
 		fva = cmd.arg0;
-		if (!cmd.arg2 || cmd.arg2 > MAX_CMD_BYTES) {
+		total = cmd.arg2;
+		if (!total || total > MAX_CMD_BYTES) {
 			code = VGPU_FAULT_BAD_ARG;
 			goto fault;
 		}
-		code = vrm_xlate(g, ctx, cmd.arg0, cmd.arg2, 1, &dst);
+		if (!off) {
+			code = vrm_xlate(g, ctx, cmd.arg0, total, 1, &dst);
+			if (code)
+				goto fault;
+			fva = cmd.arg1;
+			code = vrm_xlate(g, ctx, cmd.arg1, total, 0, &a);
+			if (code)
+				goto fault;
+		}
+		n = min_u64(total - off, CHUNK_BYTES);
+		/*
+		 * Keep memmove semantics across chunks: if dst overlaps the tail
+		 * of src, copy back to front so no chunk reads bytes an earlier
+		 * chunk already overwrote.
+		 */
+		if (cmd.arg0 > cmd.arg1 && cmd.arg0 < cmd.arg1 + total)
+			pos = total - off - n;
+		else
+			pos = off;
+		fva = cmd.arg0 + pos;
+		code = vrm_xlate(g, ctx, cmd.arg0 + pos, n, 1, &dst);
 		if (code)
 			goto fault;
-		fva = cmd.arg1;
-		code = vrm_xlate(g, ctx, cmd.arg1, cmd.arg2, 0, &a);
+		fva = cmd.arg1 + pos;
+		code = vrm_xlate(g, ctx, cmd.arg1 + pos, n, 0, &a);
 		if (code)
 			goto fault;
-		memmove(dst, a, cmd.arg2);
-		cost += cmd.arg2 >> 3;
+		memmove(dst, a, n);
+		cost += n >> 3;
+		off += n;
 		break;
+	}
 
 	case VGPU_OP_VEC_ADD:
 	case VGPU_OP_VEC_MUL: {
 		u32 *d, *x, *y;
-		u64 bytes = (u64)cmd.count * 4;
 
 		if (ch->engine != VGPU_ENGINE_COMPUTE) {
 			code = VGPU_FAULT_WRONG_ENGINE;
 			goto fault;
 		}
 		fva = cmd.arg0;
-		if (!cmd.count || cmd.count > MAX_VEC_ELEMS ||
+		total = cmd.count;
+		if (!total || total > MAX_VEC_ELEMS ||
 		    ((cmd.arg0 | cmd.arg1 | cmd.arg2) & 3)) {
 			code = VGPU_FAULT_BAD_ARG;
 			goto fault;
 		}
-		code = vrm_xlate(g, ctx, cmd.arg0, bytes, 1, &dst);
-		if (code)
-			goto fault;
-		fva = cmd.arg1;
-		code = vrm_xlate(g, ctx, cmd.arg1, bytes, 0, &a);
-		if (code)
-			goto fault;
-		fva = cmd.arg2;
-		code = vrm_xlate(g, ctx, cmd.arg2, bytes, 0, &b);
+		if (!off) {
+			code = vrm_xlate(g, ctx, cmd.arg0, total * 4, 1, &dst);
+			if (code)
+				goto fault;
+			fva = cmd.arg1;
+			code = vrm_xlate(g, ctx, cmd.arg1, total * 4, 0, &a);
+			if (code)
+				goto fault;
+			fva = cmd.arg2;
+			code = vrm_xlate(g, ctx, cmd.arg2, total * 4, 0, &b);
+			if (code)
+				goto fault;
+		}
+		n = min_u64(total - off, CHUNK_ELEMS);
+		fva = cmd.arg0;
+		code = vrm_xlate(g, ctx, cmd.arg0 + off * 4, n * 4, 1, &dst);
+		if (!code)
+			code = vrm_xlate(g, ctx, cmd.arg1 + off * 4, n * 4, 0, &a);
+		if (!code)
+			code = vrm_xlate(g, ctx, cmd.arg2 + off * 4, n * 4, 0, &b);
 		if (code)
 			goto fault;
 		d = dst;
 		x = a;
 		y = b;
 		if (cmd.op == VGPU_OP_VEC_ADD)
-			for (i = 0; i < cmd.count; i++)
+			for (i = 0; i < n; i++)
 				d[i] = x[i] + y[i];
 		else
-			for (i = 0; i < cmd.count; i++)
+			for (i = 0; i < n; i++)
 				d[i] = x[i] * y[i];
-		cost += (u64)cmd.count << 2;    /* 4 ns / element */
+		cost += n << 2;                 /* 4 ns / element */
+		off += n;
 		break;
 	}
 
@@ -236,11 +295,18 @@ static enum exec_result exec_one(struct vrm_gpu *g, struct vrm_channel *ch,
 		goto fault;
 	}
 
+	ch->busy_ns += cost;
+	*cost_ns = cost;
+	if (off < total) {
+		/* More chunks to go: keep the command at the head of the ring. */
+		ch->progress = off;
+		vrm_trace(g, VGPU_EV_CHUNK, ch->id, ch->engine, cmd.op, cost);
+		return EXEC_RAN;
+	}
+	ch->progress = 0;
 	vrm_trace(g, VGPU_EV_CMD, ch->id, ch->engine, cmd.op, cost);
 	vrm_store_release32(&ch->ctrl->get, get + 1);
 	ch->cmds_executed++;
-	ch->busy_ns += cost;
-	*cost_ns = cost;
 	return EXEC_RAN;
 
 fault:
@@ -255,7 +321,8 @@ static void end_slice(struct vrm_gpu *g, struct vrm_engine *eng, u32 e)
 {
 	if (!eng->cur)
 		return;
-	vrm_trace(g, VGPU_EV_SLICE_END, eng->cur->id, e, 0,
+	/* arg=1 marks a slice that ended in the middle of a command. */
+	vrm_trace(g, VGPU_EV_SLICE_END, eng->cur->id, e, eng->cur->progress != 0,
 		  eng->vclock_ns - eng->slice_start_ns);
 	eng->cur = NULL;
 }
@@ -335,6 +402,48 @@ out:
 	vrm_unlock(&g->lock);
 }
 
+/* ---- doorbell-less submission ----------------------------------------- */
+
+static void set_need_doorbell(struct vrm_gpu *g, u32 e, u32 v)
+{
+	u32 i;
+
+	for (i = 0; i < VRM_MAX_CHAN; i++) {
+		struct vrm_channel *ch = &g->chan[i];
+
+		if (ch->state == VRM_CHAN_ACTIVE && ch->engine == e)
+			vrm_store_release32(&ch->ctrl->need_doorbell, v);
+	}
+}
+
+int vrm_engine_arm_sleep(struct vrm_gpu *g, u32 e)
+{
+	u32 i;
+	int pending = 0;
+
+	vrm_lock(&g->lock);
+	set_need_doorbell(g, e, 1);
+	/* Order the flag stores before re-reading 'put' (pairs with client). */
+	vrm_mb();
+	for (i = 0; i < VRM_MAX_CHAN && !pending; i++) {
+		struct vrm_channel *ch = &g->chan[i];
+
+		if (ch->state == VRM_CHAN_ACTIVE && ch->engine == e)
+			pending = chan_ready(g, ch);
+	}
+	if (pending)
+		set_need_doorbell(g, e, 0);
+	vrm_unlock(&g->lock);
+	return pending;
+}
+
+void vrm_engine_disarm(struct vrm_gpu *g, u32 e)
+{
+	vrm_lock(&g->lock);
+	set_need_doorbell(g, e, 0);
+	vrm_unlock(&g->lock);
+}
+
 /* ---- channel management ----------------------------------------------- */
 
 void vrm_chan_free_locked(struct vrm_gpu *g, struct vrm_channel *ch)
@@ -399,6 +508,8 @@ int vrm_chan_create(struct vrm_gpu *g, struct vrm_ctx *ctx, u32 engine,
 	ch->ctrl_obj = ctrl;
 	ch->ctrl = (struct vgpu_chan_ctrl *)(g->vram +
 			((u64)ctrl->first_page << VGPU_PAGE_SHIFT));
+	/* Conservative until the engine clears it: the engine may be asleep. */
+	ch->ctrl->need_doorbell = 1;
 	ctx->nchan++;
 
 	*chan_id = ch->id;
@@ -433,12 +544,14 @@ int vrm_chan_doorbell(struct vrm_gpu *g, struct vrm_ctx *ctx, u32 chan_id)
 
 	vrm_lock(&g->lock);
 	ch = chan_by_id(g, ctx, chan_id);
-	if (!ch)
+	if (!ch) {
 		ret = -ENOENT;
-	else if (ch->state == VRM_CHAN_ERROR)
+	} else if (ch->state == VRM_CHAN_ERROR) {
 		ret = -EIO;
-	else
+	} else {
+		g->doorbells++;
 		vrm_trace(g, VGPU_EV_DOORBELL, ch->id, ch->engine, 0, 0);
+	}
 	vrm_unlock(&g->lock);
 	return ret;
 }

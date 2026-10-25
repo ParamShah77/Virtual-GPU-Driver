@@ -220,6 +220,7 @@ Channel &Channel::operator=(Channel &&o) noexcept
         id_ = o.id_;
         entries_ = o.entries_;
         local_put_ = o.local_put_;
+        always_doorbell_ = o.always_doorbell_;
         o.id_ = 0;
         o.ctrl_ = nullptr;
     }
@@ -330,6 +331,12 @@ Channel &Channel::wait_sem(uint64_t sem_va, uint32_t value)
 void Channel::submit()
 {
     __atomic_store_n(&ctrl_->put, local_put_, __ATOMIC_RELEASE);
+    // Pairs with the engine's flag-store / barrier / put-load before sleeping:
+    // either it sees our put, or we see need_doorbell.
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!always_doorbell_ &&
+        !__atomic_load_n(&ctrl_->need_doorbell, __ATOMIC_RELAXED))
+        return;
     int r = be_->doorbell(id_);
     if (r < 0 && r != -EIO)
         throw Error("DOORBELL", r);
