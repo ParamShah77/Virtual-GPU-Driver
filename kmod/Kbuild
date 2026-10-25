@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0
+# The OS-agnostic core in ../core is built into the module as-is.
+obj-m += vgpu.o
+vgpu-y := vgpu_main.o ../core/vrm_mem.o ../core/vrm_exec.o ../core/vrm_misc.o
+
+ccflags-y := -I$(src)/../include -I$(src)/../core
